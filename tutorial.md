@@ -1,6 +1,5 @@
----
-Title: Seastar tutorial中文翻译
----
+
+# Seastar tutorial中文翻译
 
 原文链接：https://github.com/scylladb/Seastar/blob/master/doc/tutorial.md
 
