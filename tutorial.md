@@ -629,7 +629,7 @@ $ ./a.out
 program failed with uncaught exception: bind: Address already in use
 ```
 
-这是因为在默认情况下，日过有任何就旧连接使用过的痕迹，Seastar就会拒绝重用这个本地端口。在我们的傻傻的server中，因为server这边先关掉的链接，每个连接会会在关闭后"`TIME_WAIT`"的时间内保持linger，从而阻止`listen()`同一个端口。幸运的是，我们可以通过下列配置项来让`listen()`在`TIME_WAIT`中仍可以运行。这个选项类似于`socket(7)`的`SO_REUSADDR`：
+这是因为在默认情况下，如果有任何就旧连接使用过的痕迹，Seastar就会拒绝重用这个本地端口。在我们的傻傻的server中，因为server这边先关掉的链接，每个连接会会在关闭后"`TIME_WAIT`"的时间内保持linger，从而阻止`listen()`同一个端口。幸运的是，我们可以通过下列配置项来让`listen()`在`TIME_WAIT`中仍可以运行。这个选项类似于`socket(7)`的`SO_REUSADDR`：
 
 ```c++
     seastar::listen_options lo;
