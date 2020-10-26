@@ -33,7 +33,7 @@ Seastar使用2个概念——__future__和__continuation__——提供了一个�
 
 然而，写异步server应用的人们在今天仍然会遇到2个主要问题。
 
-- **复杂性**：写一个简单的异步server是很简单的。然而写复杂异步server的难度重名昭著。我们不再能用一些简单易读的函数调用来处理一个连接，而是需要引入大量回调函数，和一个复杂的状态机，用于记录对于那些事件应该调用那些函数。
+- **复杂性**：写一个简单的异步server是很简单的。然而写复杂异步server的难度臭名昭著。我们不再能用一些简单易读的函数调用来处理一个连接，而是需要引入大量回调函数，和一个复杂的状态机，用于记录对于哪些事件应该调用哪些函数。
 - **非阻塞**：因为context switch很慢，所以一个核只有一个线程是对性能很重要的。然而，如果我们每个核只有一个线程，处理事件的函数就_永远_不能阻塞，不然这个核就会被闲置。例如，Cassandra是一个异步server应用，但是因为磁盘I/O使用了`mmap`，其可能会不受控制地阻塞整个线程，他们不得不在一个CPU上运行多个线程。
 
 除此以外，当需求更高的性能的时候，server应用，以及其使用的框架，不得不考虑一下的2件事：
@@ -51,7 +51,7 @@ Seastar是一个让人可以比较直接地实现非阻塞、异步代码的事�
 - Cooperative micro-task scheduler
 - Share-nothing SMP架构
 - 基于future的APIs
-- **Share-nothing TCP stack**：Seastar可以直接使用本机操作系统的TCP stack。在此之外，它也提供了一套基于tash scheduler和share-nothing架构的高性能TCP/IIP stack。这套stack提供双向零拷贝：你可以直接用TCP stack的buffer处理数据，并在不进行拷贝的情况下发送你的数据结构。
+- **Share-nothing TCP stack**：Seastar可以直接使用本机操作系统的TCP stack。在此之外，它也提供了一套基于task scheduler和share-nothing架构的高性能TCP/IP stack。这套stack提供双向零拷贝：你可以直接用TCP stack的buffer处理数据，并在不进行拷贝的情况下发送你的数据结构。
 - DMA-based存储APIs
 
 本教程针对于熟悉C++的开发者，并会覆盖如何用Seastar创建一个新的应用程序。
@@ -350,9 +350,9 @@ seastar::future<> f() {
 
 ## Ready futures
 
-一个future可能在运行`then()`之前就已经准备好了。这种重要的情况被优化过，_往往_continuation会被直接运行，而不再用被注册，并等待下一个迭代步的event loop了。
+一个future可能在运行`then()`之前就已经准备好了。我们优化过这种这种重要的情况。对于这种情况，*往往*continuation会被直接运行，而不再用被注册进事件循环，等待事件循环的下一个迭代步了。
 
-在_大多数时候_都会进行这种优化，除了：`then()`的实现维护了一个会立刻执行的continuation的计数器，在超过一定量continuation被直接运行后（目前限制为256个），下一个continuation一定会被放入event loop。这种机制是因为我们发现在一些情况下（例如后文会讨论的future循环），我们会发现每个准备好的continuation会立刻生成一个新的，没有这种限制我们就会starve事件循环。让事件循环可以运行非常重要，不然就无法运行之后准备好的continuation了，也会starve事件循环会进行的重要的**polling**（例如，检查是否网卡有新的活动_(activity)_）。
+在*大多数时候*都会进行上述优化，除了以下情况：`then()`的内部实现里面维护了一个会记录有多少个continuation被立刻执行了用的计数器，在超过一定量continuation被直接运行后（目前限制为256个），下一个continuation一定会被放入事件循环里。之所以引入这种机制是因为我们发现在一些情况下（例如后文会讨论的future循环），每个准备好的continuation会立刻生成一个新的准备好的continuation。那么如果没有上述的计数器限制，我们就会一直在立即执行continuation，而不再进入事件循环，从而starve事件循环。让事件循环可以正常运行非常重要，不然无法运行在事件循环中的其他的continuation了，也会starve事件循环会进行的**polling**（例如，检查是否网卡有新的活动 *(activity)* ），这种polling非常重要。
 
 `make_ready_future<>`可以被用来返回一个已经准备好了的future。下面的例子和之前的几乎完全相同，只是`fast()`会返回一个已经准备好了的future。所幸future的接受者不在乎这个区别，并会用相同的方式处理这两种情况：
 
@@ -743,7 +743,7 @@ seastar::future<> service_loop_3() {
 }
 ```
 
-主要的`service_loop`函数会接受新的连接，并对每个连接调用`handle_connection()`。`handle_connection()`会返回一个描述何时处理完连接的future。重要的是，我们**不**等待这个future：记住`keep_doing`只会在前一个future准备好之后才会进行下一个迭代步。因为偶尔们像要允许并行运行的连接，我们不希望`accept()`要等到前一个连接关闭才能运行，所以我们调用`handle_connection()`以开始处理connection，但是不返回任何future，从而使得这个返回的空future立即准备好，从而`keep_doing`可以继续运行下一个`accept()`。
+主要的`service_loop`函数会接受新的连接，并对每个连接调用`handle_connection()`。`handle_connection()`会返回一个描述何时处理完连接的future。重要的是，我们**不**等待这个future：记住`keep_doing`只会在前一个future准备好之后才会进行下一个迭代步。因为我们想要允许并行运行的连接，我们不希望`accept()`要等到前一个连接关闭才能运行，所以我们调用`handle_connection()`以开始处理connection，但是不返回任何future，从而使得这个返回的空future立即准备好，从而`keep_doing`可以继续运行下一个`accept()`。
 
 这展示了在Seastar中并行运行filber（continuation链）是多么得容易——当一个continuation运行了一个异步函数但是忽略了其返回的future的时候，这个异步函数会并行运行，不会等待。
 
