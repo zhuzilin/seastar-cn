@@ -416,11 +416,57 @@ TODO: We already saw chaining example in slow() above. talk about the return fro
 
 # 管理生命周期
 
+一个异步函数可能会启动一个会在本函数返回后还会运行很久的操作：函数自身会在运行的时候立即返回一个`future<T>`，但是等这个future准备好需要很久。
 
+当这样的异步操作需要操作现存的对象，或者是临时对象，我们需要留心这些对象的*生命周期*：我们得保证这些对象不会在异步操作完成之前被释放，并保证对象在不被需要的时候能最终被释放（以防内存泄漏）。Seastar提供了很多种用于安全高效地保证对象在合适的时间存货的机制。在本节中，我们会探索这些机制，并告诉大家每一种该何时使用。
 
-## 把所属权传给continuation
+## 把所有权传给continuation
 
+最直接的方法就是把对象的所有权传给continuation。当一个continuation*拥有*了对象，对象就会在continuation运行的过程中被保存着，并在continuation不再被需要的时候被释放。
 
+我们已经看到如何通过*捕获**(capturing)*来让continuation获取一个对象的所有权：
+
+```c++
+seastar::future<> slow_incr(int i) {
+    return seastar::sleep(10ms).then([i] { return i + 1; });
+}
+```
+
+在上例中，continuation捕获了`i`的值，换句话说，continuation有一份`i`的拷贝。当continuation在10ms后开始运行时，它可以访问到这个值，并在其运行结束的时候，continuation本身这个对象会被释放，它捕获的`i`的拷贝也随之被释放了。continuation拥有`i`的这个拷贝。
+
+如我们在这里进行的用值捕获*(capturing by value)*——创建一个我们需要的对象的拷贝——大多数情况下适用于例子中像整数这样的很小的对象。其他一些对象的拷贝成本可能很高，甚至不能被拷贝。例如，下面这么做就**不**太好。
+
+```c++
+seastar::future<> slow_op(std::vector<int> v) {
+    // this makes another copy of v:
+    return seastar::sleep(10ms).then([v] { /* do something with v */ });
+}
+```
+
+上面这样可能会很低效——因为需要拷贝可能很长的vector`v`，并且要在continuation中存一份。在本例中，我们没必要复制`v`——在`slow_op`中我们已经传值了，并且在capture之后没有再对`v`做其他的操作了，所以`slow_op`再返回的时候会释放自己的那份`v`。
+
+对于这种情况，C++14允许把对象*move*进continuation：
+
+```c++
+seastar::future<> slow_op(std::vector<int> v) {
+    // v is not copied again, but instead moved:
+    return seastar::sleep(10ms).then([v = std::move(v)] { /* do something with v */ });
+}
+```
+
+C++11引入了move constructor，可以把vector的数据移进continuation，并释放原始的vector。Moving会很快——对于vector，moving操作只需要复制几个指针这样的小field。如之前那样，一旦continuation退出了vector就会被释放——并且其底层的数组（是被move操作移进来的）也会随之被释放。
+
+TODO: talk about temporary_buffer as an example of an object designed to be moved in this way.
+
+一些情况下，move对象不是很合适。例如，一些对象的引用或者一些成员以引用的形式被存在其他对象里了，那么这些引用会在这个对象被move之后变得不可用。在一些更复杂的例子里，move constructor甚至都有些慢。对于这些情况，C++提供了`std::unique_ptr<T>`。`std::unique_ptr<T>`是一个拥有另一个类型的`T`的对象的对象。当`std::unique_ptr<T>`被move了，内部的`T`对象并没有变化——仅仅是指向`T`对象的指针发生了变化。`std::unique_ptr<T>`的用例如下：
+
+```c++
+seastar::future<> slow_op(std::unique_ptr<T> p) {
+    return seastar::sleep(10ms).then([p = std::move(p)] { /* do something with *p */ });
+}
+```
+
+`std::unique_ptr<T>`是传递unique ownership对象的C++标准机制：对象在同一时刻只会被一段代码拥有，且所有权通过move `unique_ptr`对象进行转移。`unique_ptr`对象不能被复制：如果我们尝试用值去捕获`p`，会引发编译错误。
 
 ## Keeping ownership at the caller
 
@@ -432,7 +478,27 @@ TODO: We already saw chaining example in slow() above. talk about the return fro
 
 ## Saving objects on the stack
 
+如果我们能把对象存在栈里，也就是和同步代码的写法一样不是更好吗？比如：
 
+```c++
+int i = ...;
+seastar::sleep(10ms).get();
+return i;
+```
+
+用有自己堆栈的`seastar::thread`对象的话，Seastar就允许写这样的代码了。一个完整的使用`seastar::thread`的例子如下：
+
+```c++
+seastar::future<> slow_incr(int i) {
+    return seastar::async([i] {
+        seastar::sleep(10ms).get();
+        // We get here after the 10ms of wait, i is still available.
+        return i + 1;
+    });
+}
+```
+
+我们会在Seastar thread一节介绍 `seastar::thread`, `seastar::async()` 和 `seastar::future::get()` 。
 
 # 高级future
 
@@ -876,11 +942,115 @@ Seastar需要整个应用被sharded，也就是说，在不同线程上运行的
 
 # Seastar::thread
 
+Seastar的使用future和continuation的模型是强有力且高效的。然而，如我们在上面的那些例子中所见，代码会变得冗长：每次我们需要异步进行某个计算工作的时候都需要写一个新的continuation。我们也需要关心在不同的continuation之间的数据传递（用我们在[管理生命周期]一节提到的技巧）。像循环这样的简单的控制流也需要引入continuatino。例如，考虑下面这个简单的同步代码：
 
+```c++
+    std::cout << "Hi.\n";
+    for (int i = 1; i < 4; i++) {
+        sleep(1);
+        std::cout << i << "\n";
+    }
+```
+
+在Seastar中，使用future和continuation，我们需要这么写：
+
+```c++
+    std::cout << "Hi.\n";
+    return seastar::do_for_each(boost::counting_iterator<int>(1),
+        boost::counting_iterator<int>(4), [] (int i) {
+        return seastar::sleep(std::chrono::seconds(1)).then([i] {
+            std::cout << i << "\n";
+        });
+    });
+```
+
+不过Seastar允许我们用`seastar::thread`让代码变得更像同步代码。`seastar::thread`提供了一个允许阻塞的执行环境：你可以发起一个异步函数，并在同一个函数中进行等待，而不是用`then()`加callback：
+
+```c++
+    seastar::thread th([] {
+        std::cout << "Hi.\n";
+        for (int i = 1; i < 4; i++) {
+            seastar::sleep(std::chrono::seconds(1)).get();
+            std::cout << i << "\n";
+        }
+    });
+```
+
+`seastar::thread`不是操作系统的一个线程。它还是会使用continuation，也就是单线程（每个核）。它的工作原理是：
+
+`seastar::thread`会分配128KB大的堆栈，并且会在`get()`函数*阻塞*之前正常运行函数。**在`seastar::thread`的context之外，`get()`只能在一个已经可用的future上执行**。但是在thread里面，在还不可用的future上调用`get()`会暂停thread函数，并调度运行这个future的continuation。待这个future可用了再继续运行thread函数（在同一个保存过的堆栈上）。
+
+如普通的continuation一样，`seastar::thread`总是在它启动的核上运行。他们是cooperative的：相互之间不会抢占，除非`seastar::future::get()`引发了阻塞，或者有显示的`seastar::thread::yield()`。
+
+还是要重申，`seastar::thread`不是POSIX线程，它只能阻塞Seastar future，而不能阻塞系统调用。上面的例子用的是`seastar::sleep()`，而不是系统调用`sleep()`。`seastar::thread`函数可以正常地throw与catch异常。记住如果future resolve出了异常，`get()`会throw异常。
+
+出了`seastar::futture::get()`，我们还有`seastar::future::wait()`。它用来等待future，但是**不**获取future的值。在你希望避免throw异常的时候可能会有用，例如：
+
+```c++
+    future<char> getchar();
+    int try_getchar() noexcept { // run this in seastar::thread context
+        future fut = get_char();
+        fut.wait();
+        if (fut.failed()) {
+            return -1;
+        } else {
+            // Here we already know that get() will return immediately,
+            // and will not throw.
+            return fut.get();
+        }
+    }
+```
 
 ## Starting and ending a seastar::thread
 
+在我们创建了一个`seastar::thread`对象之后，我们需要用`join()`方法来等待其结束。我们也需要在`join()`完成前确保thread对象活着。因此一个完整的使用`seastar::thread`的例子如下：
 
+```c++
+#include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
+seastar::future<> f() {
+    seastar::thread th([] {
+        std::cout << "Hi.\n";
+        for (int i = 1; i < 4; i++) {
+            seastar::sleep(std::chrono::seconds(1)).get();
+            std::cout << i << "\n";
+        }
+    });
+    return do_with(std::move(th), [] (auto& th) {
+        return th.join();
+    });
+}
+```
+
+`seastar::async`提供了创建一个`seastar::thread`的快捷方式，并且会在thread完成之后才resolve返回的future。
+
+```c++
+#include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
+seastar::future<> f() {
+    return seastar::async([] {
+        std::cout << "Hi.\n";
+        for (int i = 1; i < 4; i++) {
+            seastar::sleep(std::chrono::seconds(1)).get();
+            std::cout << i << "\n";
+        }
+    });
+}
+```
+
+`seastar::async()`的lambda可以返回值，例如：
+
+```c++
+seastar::future<seastar::sstring> read_file(sstring file_name) {
+    return seastar::async([file_name] () {  // lambda executed in a thread
+        file f = seastar::open_file_dma(file_name).get0();  // get0() call "blocks"
+        auto buf = f.dma_read(0, 512).get0();  // "block" again
+        return seastar::sstring(buf.get(), buf.size());
+    });
+};
+```
+
+当`seastar::thread`和`seastar::async()`让编程变得更简单的同时，它们也相较于直接使用continuation的写法增加了overhead。最明显的overhead是，每个`seastar::thread`都需要分配额外的内存用于其堆栈。所以用`seastar::thread`来处理一个高并发操作并不是个好主意——应该去用future和continuation。不过如果你知道你写的代码只会有很小的并发量的时候，例如，后台的清理操作，`seastar::thread`是一个好的选择。`seastar::thread`也适用于不在意性能的代码——如测试代码。
 
 # Isolation of application components
 
